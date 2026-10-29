@@ -377,7 +377,7 @@
 <script>
 /* ============ CONFIG ============ */
 // Reemplaza por la URL de tu Web App de Apps Script (Implementar > Nueva implementación > Aplicación web)
-const GAS_URL = "https://script.google.com/macros/s/AKfycbxWZUIm_l5_UgwpmwqMDM4Osfh6fK_OkhVyY0xikgNgZK5toBErAhT4sfYwR9OUtfC6/exec";
+const GAS_URL = "https://script.google.com/macros/s/AKfycbz-Ami5cXYDTUlouJ6vnJUf78JdCbzE-Dq645EVSHWP0k8JxDxQwhSuJ0C7dyfmJA50mQ/exec";
 const STORAGE_KEY = "stop_cards_queue_v1";
 const FORM_CODE = "SI-006/Rev.2";
 
@@ -631,9 +631,8 @@ function refreshPendingDot(){
 }
 refreshPendingDot();
 
-/* ============ Correlativo (único y global, lo entrega Google) ============ */
-const CORR_KEY = "stop_correlativo_actual";
-let correlativo = null, corrBusy_ = false, corrFails_ = 0;   // corrFails_: fallos seguidos (tras 5 deja de reintentar sola)
+/* ============ Correlativo informativo: solo se consume al enviar ============ */
+let correlativo = null, corrBusy_ = false;
 
 function fmtCorr_(n){ return (n === null || n === undefined || n === "") ? "—" : String(n).padStart(4, "0"); }
 
@@ -643,13 +642,12 @@ function renderCorr_(){
   const box = document.getElementById("corrBox");
   if(box){
     box.classList.toggle("pend", correlativo == null);
-    box.querySelector(".lbl").textContent = correlativo == null ? "toca: reintentar" : "N° tarjeta";
+    box.querySelector(".lbl").textContent = correlativo == null ? "se asigna al enviar" : "próximo N°";
   }
 }
 
-/* Pide un número nuevo al script. Devuelve el entero, o null y deja el motivo en corrError_. */
+/* Consulta el próximo número sin reservarlo ni consumirlo. */
 let corrError_ = "";
-// Compatibilidad: el ID de la implementación ya va dentro del mensaje (corrFail_), así que esto no agrega nada.
 function tag_(){ return ""; }
 function gasId_(){ const m = GAS_URL.match(/\/s\/([^/]+)\//); return m ? m[1].slice(0, 12) : "?"; }
 function corrFail_(msg){ corrError_ = msg + " [implementación " + gasId_() + "…]"; return null; }
@@ -660,41 +658,21 @@ async function fetchCorrelativo_(){
   const ctl = new AbortController();
   const t = setTimeout(()=> ctl.abort(), 10000);
   try{
-    const res = await fetch(GAS_URL + "?accion=siguiente&_=" + Date.now(), {signal: ctl.signal, cache: "no-store"});
-    if(res.status === 404) return corrFail_("Google no encuentra esa implementación (404): URL archivada o incorrecta");
-    let d = null;
-    try{ d = await res.json(); }
-    catch(e){
-      return corrFail_("El script no respondió JSON. Revisa que el acceso sea «Cualquier persona» y que esté autorizado");
-    }
-    if(d && d.ok === true && Number.isInteger(d.correlativo)) return d.correlativo;
-    return corrFail_((d && d.ok === true)
-      ? "El script está desactualizado: publica una Nueva versión"
-      : "El script respondió: " + ((d && d.error) || "error desconocido"));
+    const res = await fetch(GAS_URL + "?accion=estado&_=" + Date.now(), {signal: ctl.signal, cache:"no-store"});
+    if(res.status === 404) return corrFail_("Google no encuentra esa implementación (404)");
+    const d = await res.json();
+    if(d && d.ok === true && Number.isInteger(d.proximoCorrelativo)) return d.proximoCorrelativo;
+    return corrFail_((d && d.error) || "El backend no informó el próximo correlativo");
   }catch(e){
-    return corrFail_((e && e.name === "AbortError")
-      ? "El script tardó demasiado en responder"
-      : "No se pudo conectar con el script. Si la consola dice 404, la URL es incorrecta o está archivada");
+    return corrFail_((e && e.name === "AbortError") ? "El script tardó demasiado" : "No se pudo consultar el correlativo");
   }finally{ clearTimeout(t); }
 }
 
-/* Deja un número reservado para la tarjeta en curso. Si recargas la página reutiliza el mismo. */
 async function initCorrelativo_(){
-  if(corrBusy_ || correlativo != null) return;
+  if(corrBusy_) return;
   corrBusy_ = true;
-  try{
-    let n = null;
-    try{ const v = localStorage.getItem(CORR_KEY); if(v) n = parseInt(v, 10); }catch(e){}
-    if(!Number.isInteger(n)){
-      n = await fetchCorrelativo_();
-      if(n !== null){ corrFails_ = 0; try{ localStorage.setItem(CORR_KEY, String(n)); }catch(e){} }
-      else corrFails_++;
-    }
-    correlativo = Number.isInteger(n) ? n : null;
-  } finally {
-    corrBusy_ = false;
-    renderCorr_();
-  }
+  try{ correlativo = await fetchCorrelativo_(); }
+  finally{ corrBusy_ = false; renderCorr_(); }
 }
 
 function buildPayload(){
@@ -746,13 +724,9 @@ async function ensureLibs_(){
    El PDF se genera aquí, al enviar, y NO se guarda en la cola (la cola solo guarda datos livianos). */
 async function trySend(payload){
   if(GAS_URL.includes("PEGA_AQUI")) return {ok:false, error:"Falta configurar GAS_URL"};
-  if(payload.correlativo == null){
-    const n = await fetchCorrelativo_();
-    if(n === null) return {ok:false, error:"Sin N° de tarjeta: " + corrError_ + tag_()};
-    payload.correlativo = n;
-    const q = getQueue(), it = q.find(x => x.id === payload.id);   // se guarda ya: un reintento no pide otro
-    if(it){ it.correlativo = n; setQueue(q); }
-  }
+  // El número mostrado es solo una vista previa. El backend asigna el oficial en el POST.
+  const n = await fetchCorrelativo_();
+  if(n !== null) payload.correlativo = n;
   const body = Object.assign({}, payload);
   try{
     await ensureLibs_();
@@ -769,7 +743,14 @@ async function trySend(payload){
       body: JSON.stringify(body)
     });
     const data = await res.json();
-    if(data && data.ok === true) return {ok:true, sinPdf: !!body.sinPdf};
+    if(data && data.ok === true){
+      if(Number.isInteger(data.correlativo)){
+        payload.correlativo = data.correlativo;
+        correlativo = data.correlativo + 1;
+        renderCorr_();
+      }
+      return {ok:true, sinPdf: !!body.sinPdf, correlativo: data.correlativo};
+    }
     return {ok:false, error:(data && data.error) || "El servidor no confirmó la recepción"};
   }catch(e){
     return {ok:false, error:"Sin conexión o sin respuesta del servidor"};
@@ -1030,9 +1011,8 @@ function resetCard_(){
   updateStatus();
   sigReset_();                         // las firmas son de cada tarjeta: se borran
   correlativo = null;
-  try{ localStorage.removeItem(CORR_KEY); }catch(e){}
   renderCorr_();
-  initCorrelativo_();                  // reserva el número de la tarjeta siguiente
+  initCorrelativo_();                  // solo consulta el próximo número; no lo reserva
   goToPage1();
 }
 
@@ -1081,7 +1061,7 @@ document.getElementById("btnGuardar").addEventListener("click", async ()=>{
   const btn = document.getElementById("btnGuardar");
   btn.disabled = true; btn.textContent = "Guardando...";
   setFechaNow();                       // la hora es la del guardado, no la de apertura
-  if(correlativo == null) await initCorrelativo_();   // último intento antes de dejarla 'pendiente'
+  if(correlativo == null) await initCorrelativo_();   // consulta informativa; no consume número
   const payload = buildPayload();
   const q = getQueue(); q.push(payload);
   const saved = setQueue(q);
@@ -1098,19 +1078,16 @@ document.getElementById("btnSync").addEventListener("click", async ()=>{
   await syncQueue_();
 });
 
-window.addEventListener("online", ()=>{ corrFails_ = 0; initCorrelativo_(); syncQueue_(); });
+window.addEventListener("online", ()=>{ initCorrelativo_(); syncQueue_(); });
 if(getQueue().length > 0) setTimeout(()=> syncQueue_(), 1500);
 renderCorr_();
 initCorrelativo_();
 document.getElementById("corrBox").addEventListener("click", async ()=>{
-  if(correlativo != null){ showToast("Tarjeta N° " + fmtCorr_(correlativo)); return; }
-  corrFails_ = 0;
-  showToast("Pidiendo N° de tarjeta...");
+  showToast("Consultando próximo N°...");
   await initCorrelativo_();
-  showToast(correlativo != null ? "N° asignado: " + fmtCorr_(correlativo) : "Sin N°: " + corrError_ + tag_());
+  showToast(correlativo != null ? "Próximo N° estimado: " + fmtCorr_(correlativo) : "El N° se asignará al enviar");
 });
-setInterval(()=>{ if(correlativo == null && !document.hidden && corrFails_ < 5) initCorrelativo_(); }, 20000);
-document.addEventListener("visibilitychange", ()=>{ if(!document.hidden && corrFails_ < 5) initCorrelativo_(); });
+document.addEventListener("visibilitychange", ()=>{ if(!document.hidden) initCorrelativo_(); });
 
 document.getElementById("btnPdf").addEventListener("click", ()=> window.print());
 
